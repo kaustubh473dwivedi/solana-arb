@@ -52,6 +52,11 @@ function getReadOnlyProvider() {
     // not whatever version this project's hoisted top-level node_modules
     // resolves to (0.31.0/0.32.1, from the other Solana SDKs pulled in) --
     // those aren't guaranteed IDL/API-compatible with what openbook-v2 expects.
+    // Deliberately NOT added to package.json: @meteora-ag/dlmm, @openbook-dex/
+    // openbook-v2, and @orca-so/whirlpools-sdk each pin a genuinely different,
+    // non-deduped anchor version (0.31.0/0.29.0/0.32.1) -- there's no single
+    // "the" version to declare, and a top-level entry wouldn't be what this
+    // scoped require below actually resolves to anyway.
     const openbookMainPath = require.resolve("@openbook-dex/openbook-v2");
     const scopedRequire = createRequire(openbookMainPath);
     const anchor = scopedRequire("@coral-xyz/anchor");
