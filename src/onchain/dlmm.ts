@@ -59,18 +59,25 @@ export async function fetchDlmmState(poolAddress: PublicKey): Promise<DLMMState>
 
   const activeBinArrayIndex = DLMM.binIdToBinArrayIndex(new BN(lbPair.activeId));
 
+  // PDA derivation is pure local computation (no RPC) -- compute all 3
+  // addresses first, then fetch them in ONE batched RPC call instead of 3
+  // sequential ones. Brings this function's total to the 2-call floor (pool
+  // account, then bin arrays), matching CLMM instead of sitting at 4.
+  const binArrayIndices = BIN_ARRAY_OFFSETS.map((offset) => activeBinArrayIndex.add(new BN(offset)));
+  const binArrayAddresses = binArrayIndices.map(
+    (index) => DLMM.deriveBinArray(poolAddress, index, METEORA_DLMM_PROGRAM_ID)[0],
+  );
+
+  const binArrayInfos: (AccountInfo<Buffer> | null)[] =
+    await mainnetConnection.getMultipleAccountsInfo(binArrayAddresses);
+
   const bins: DLMMBin[] = [];
 
-  for (const offset of BIN_ARRAY_OFFSETS) {
-    const index = activeBinArrayIndex.add(new BN(offset));
-    const [binArrayPda] = DLMM.deriveBinArray(poolAddress, index, METEORA_DLMM_PROGRAM_ID);
-
-    const binArrayInfo: AccountInfo<Buffer> | null =
-      await mainnetConnection.getAccountInfo(binArrayPda);
-    if (!binArrayInfo) continue; // uninitialized range -- no liquidity here
+  binArrayInfos.forEach((binArrayInfo, i) => {
+    if (!binArrayInfo) return; // uninitialized range -- no liquidity here
 
     const binArray = DLMM.decodeAccount(program, "binArray", binArrayInfo.data);
-    const startBinId = index.toNumber() * MAX_BIN_PER_ARRAY;
+    const startBinId = binArrayIndices[i].toNumber() * MAX_BIN_PER_ARRAY;
 
     binArray.bins.forEach((bin: { amountX: { toString(): string }; amountY: { toString(): string } }, slot: number) => {
       const binId = startBinId + slot;
@@ -83,7 +90,7 @@ export async function fetchDlmmState(poolAddress: PublicKey): Promise<DLMMState>
         reserveY: Number(bin.amountY.toString()) / 10 ** USDC_DECIMALS,
       });
     });
-  }
+  });
 
   return {
     activeBinId: lbPair.activeId,

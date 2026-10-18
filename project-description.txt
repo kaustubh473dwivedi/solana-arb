@@ -1,0 +1,998 @@
+================================================================================
+SOLANA-ARB — FULL PROJECT DESCRIPTION
+A paper-trading cross-DEX arbitrage scanner for SOL/USDC on Solana
+================================================================================
+
+Document purpose: explain, end to end, what this project does — starting from
+how it obtains credentials, through every layer of logic, down to the final
+line it writes to disk. Written to be readable without opening the code.
+
+Describes the system as it stands AFTER the 2026-10-16 latency rearchitecture.
+For the history of how it got here — every architectural, algorithmic, and
+feature change, one by one, with reasons — see project-listing.txt.
+
+--------------------------------------------------------------------------------
+0. THE ONE-PARAGRAPH VERSION
+--------------------------------------------------------------------------------
+
+solana-arb watches the SOL/USDC pair across every major Solana exchange at the
+same time and looks for moments when the same asset is priced differently in two
+places. Every couple of seconds it reads each venue's real pool state directly
+from mainnet — all venues concurrently, in one snapshot — then computes, using
+each DEX's own swap formula, "if I had 10 USDC, which venue gives me the most
+SOL, and if I sell that SOL on each of the other venues, how much USDC comes
+back?". If a round trip would end with more USDC than it started with, after
+subtracting realistic Solana transaction costs, it flags the pair as a CANDIDATE
+and writes a full record of the math to a log file. Jupiter's quote API is kept
+alongside as an independent cross-check — one venue per scan, off the hot path —
+so the bot's own math can be continuously verified against the established
+aggregator. It never signs or sends a transaction. Nothing in this codebase can
+move real money — it is a research and paper-trading tool.
+
+--------------------------------------------------------------------------------
+1. WHAT PROBLEM IT IS ACTUALLY SOLVING
+--------------------------------------------------------------------------------
+
+- On Solana there is no single "price of SOL". Each DEX holds its own liquidity
+  and therefore has its own price, drifting apart constantly as trades land.
+- A cross-DEX arbitrage is the trade that closes that gap: buy SOL where it is
+  cheap, sell it where it is expensive, pocket the spread.
+- The gaps are usually tiny (hundredths of a percent) and the costs of trading
+  (network fee, priority fee, account rent, slippage) are not tiny — so most
+  apparent opportunities are actually losses once costed out honestly.
+- The entire point of this project is to measure that honestly: to find the gap,
+  subtract every real cost, and record whether a profit would actually have
+  survived — instead of celebrating a gross number that was never achievable.
+- A secondary goal runs alongside it: not to blindly trust the price aggregator.
+  The bot computes every price itself from raw on-chain state, and continuously
+  compares its own number against Jupiter's so the two can be checked side by
+  side. As of 2026-10-16 those two numbers agree to within 0.000% on the
+  constant-product venues, which is what makes the local path trustworthy
+  enough to price on.
+- A third constraint shapes everything: SPEED. A spread you measure ten seconds
+  late is not a spread, it is two different market states. The architecture is
+  built so that every venue is read at effectively the same instant, and so
+  that comparing them costs no network round trips at all.
+
+--------------------------------------------------------------------------------
+2. TECH STACK AND SHAPE OF THE REPO
+--------------------------------------------------------------------------------
+
+- Language / runtime: TypeScript on Node.js, strict mode, ES2022 target, native
+  ESM modules ("type": "module", NodeNext resolution). Run directly with `tsx`,
+  or compiled to ./dist with `npx tsc`.
+- Core library: @solana/web3.js for RPC, plus one official SDK per DEX family —
+  @raydium-io/raydium-sdk-v2, @orca-so/whirlpools-sdk, @meteora-ag/dlmm,
+  @ellipsis-labs/phoenix-sdk, @openbook-dex/openbook-v2.
+- Low-level decoding: @solana/buffer-layout for hand-rolled byte layouts, bn.js
+  for big integers.
+- Config: dotenv.
+- No test framework, no database, no web server. Output is the terminal plus one
+  append-only JSONL file.
+
+Directory map:
+
+  solana-arb/
+  ├── .env                         credentials (gitignored)
+  ├── secrets/bot-keypair.json     devnet wallet keypair (gitignored)
+  ├── logs/
+  │   └── arbitrage-opportunities.jsonl   one JSON line per evaluated round trip
+  ├── src/
+  │   ├── index.ts                 standalone sanity-check script (not the bot)
+  │   ├── market/quotes.ts         Jupiter HTTP quote client (queued, rate-limited)
+  │   ├── execution/
+  │   │   ├── expenses.ts          cost model: fees, tip, rent, slippage haircut
+  │   │   └── swapMath.ts          pure swap math for 4 AMM architectures
+  │   ├── onchain/
+  │   │   ├── connection.ts        shared mainnet RPC connection
+  │   │   ├── stateStore.ts        concurrent market-state snapshot cache
+  │   │   ├── poolRegistry.ts      DEX name -> real pool/market address (1h cache)
+  │   │   ├── constantProduct.ts   reader: Raydium AMM v4, Orca V2
+  │   │   ├── clmm.ts              reader: Orca Whirlpool, Raydium CLMM
+  │   │   ├── dlmm.ts              reader: Meteora DLMM
+  │   │   ├── orderbook.ts         reader: Phoenix, OpenBook V2
+  │   │   └── crossCheck.ts        glue: DEX name -> fetch state -> compute swap
+  │   └── strategy/
+  │       ├── crossDex.ts          THE BOT — scan loop, detection, logging
+  │       └── collector.ts         separate mean-reversion collector (out of scope)
+  ├── SYSTEM.md / CLAUDE.md / readme.md
+  ├── project-description.txt      this file — what the system IS
+  ├── project-listing.txt          change log — how it GOT here, one by one
+  └── dist/                        compiled output (gitignored)
+
+Two programs live in src/strategy/. Only crossDex.ts is the arbitrage bot.
+collector.ts is an unrelated stat-arb data collector (it samples SOL/USDC vs
+JitoSOL/USDC prices every 5 seconds and prints them as JSON) and shares nothing
+with the bot except the Jupiter client.
+
+--------------------------------------------------------------------------------
+3. STEP ONE — CREDENTIALS AND HOW THEY ARE LOADED
+--------------------------------------------------------------------------------
+
+There are three distinct credentials/identities in this project, and they are
+loaded at three different places.
+
+3.1 The .env file (API key and RPC endpoints)
+
+- A plain .env file sits at the repo root and is listed in .gitignore, so it is
+  never committed.
+- It is read by `import "dotenv/config"` — a side-effect import placed at the
+  very top of every entry point and of every module that needs an env variable
+  (index.ts, quotes.ts, crossDex.ts, collector.ts, connection.ts). There is no
+  central config loader; each module reads process.env directly.
+- Keys actually used:
+    * JUPITER_API_KEY       — sent as the `x-api-key` header on every Jupiter
+                              quote request. quotes.ts throws immediately with
+                              "JUPITER_API_KEY is not set in .env" if missing,
+                              so a misconfigured environment fails loudly on the
+                              first quote rather than silently degrading.
+    * SOLANA_RPC_URL        — used only by src/index.ts. Falls back to the public
+                              devnet endpoint (https://api.devnet.solana.com).
+    * SOLANA_MAINNET_RPC_URL— used by src/onchain/connection.ts for all on-chain
+                              reading. Falls back to the public mainnet endpoint
+                              (https://api.mainnet-beta.solana.com). This key is
+                              optional and is not currently set in .env, so the
+                              bot reads mainnet through the public endpoint —
+                              which works, but is rate-limited and is the usual
+                              cause of occasional cross-check failures.
+- Important nuance: the bot reads MAINNET state no matter what SOLANA_RPC_URL
+  says. Real liquidity and Jupiter's routing only exist on mainnet, so pool,
+  tick, bin, and order-book decoding is hardcoded to the mainnet connection.
+
+3.2 The wallet keypair (secrets/bot-keypair.json)
+
+- A standard Solana keypair file — a JSON array of 64 bytes — stored in
+  secrets/, which is also gitignored.
+- It is loaded by src/index.ts only:
+    fs.readFileSync("./secrets/bot-keypair.json")
+      -> JSON.parse -> Uint8Array.from -> Keypair.fromSecretKey
+- Its public key is used purely to read a balance. The private key is never used
+  to sign anything anywhere in the codebase.
+- crossDex.ts — the actual bot — never touches the keypair at all. It does not
+  need an identity, because it never submits a transaction.
+
+3.3 The throwaway keypair (OpenBook only)
+
+- OpenBook V2's client library insists on a full Anchor Provider (connection +
+  wallet) even for pure read operations.
+- src/onchain/orderbook.ts satisfies this by generating a brand new random
+  keypair at runtime (Keypair.generate()) and wrapping it in an Anchor Wallet.
+- This identity is disposable, never funded, never persisted, and never signs.
+  It exists only to satisfy a type signature.
+
+3.4 Why there are no trading credentials at all
+
+- The project has no exchange API secrets, no signing key in use, no RPC write
+  path. The hard guarantee "this cannot trade" is structural, not a config flag:
+  there is simply no code anywhere that builds, signs, or sends a transaction.
+
+--------------------------------------------------------------------------------
+4. STEP TWO — ENTRY POINTS: WHAT YOU ACTUALLY RUN
+--------------------------------------------------------------------------------
+
+4.1 src/index.ts — the sanity check (not the bot)
+
+A small standalone script that proves the environment is wired up correctly:
+
+  1. Loads .env and opens a Connection to SOLANA_RPC_URL (devnet by default) at
+     "confirmed" commitment.
+  2. Loads secrets/bot-keypair.json and derives the wallet public key.
+  3. Fetches three things concurrently in effect: balance (getBalance), current
+     slot (getSlot), and node version (getVersion).
+  4. Prints a header block: network, wallet address, SOL balance (lamports
+     divided by LAMPORTS_PER_SOL), slot, and solana-core version.
+  5. Asks Jupiter for one quote: 0.1 SOL -> USDC, unrestricted routing.
+  6. Prints the output amount in USDC base units, the price impact percentage,
+     and then walks quote.routePlan to print each hop's venue label, AMM key, and
+     percentage share of the route.
+  7. On any thrown error, prints "Bot startup failed:" and exits with code 1.
+
+This file is a diagnostic. It is not imported by anything and is not part of the
+scan loop.
+
+4.2 src/strategy/crossDex.ts — the bot
+
+This is the program that does the arbitrage work. Running it starts an infinite
+scan loop that only stops when you kill the process. Everything in sections 5
+through 12 below describes what happens inside it.
+
+4.3 src/strategy/collector.ts — out of scope
+
+A separate research tool. It samples two Jupiter quotes every five seconds
+(0.1 SOL -> USDC and 0.1 JitoSOL -> USDC), converts both to a USDC price, and
+prints one JSON object per tick to stdout. It is a mean-reversion data collector,
+not an arbitrage scanner, and it writes no files. It shares only quotes.ts with
+the bot. It is explicitly excluded from arbitrage work.
+
+--------------------------------------------------------------------------------
+5. STEP THREE — THE PRICE SOURCE: JUPITER QUOTE CLIENT (src/market/quotes.ts)
+--------------------------------------------------------------------------------
+
+Every price the bot acts on comes through exactly one function:
+
+  getQuote(inputMint, outputMint, amount, dexes?) -> Promise<Quote>
+
+What it does, in order:
+
+  1. Reads JUPITER_API_KEY from the environment; throws if absent.
+  2. Builds a URL against https://api.jup.ag/swap/v1/quote with query params
+     inputMint, outputMint, and amount (amount is always in the input token's
+     smallest base units — lamports for SOL, 1e-6 units for USDC).
+  3. If a `dexes` array is supplied, it joins it into the `dexes` query param.
+     This is the critical trick that makes cross-DEX comparison possible: it
+     forces Jupiter to quote using only that one named venue, turning a routing
+     aggregator into a per-venue price oracle.
+  4. Sends the request through the rate-limit gate described below.
+  5. Throws on a non-OK HTTP status, and throws again if the JSON body carries an
+     `error` field (Jupiter returns HTTP 200 with an error body for cases like
+     "no route found").
+  6. Returns the parsed Quote: inAmount, outAmount, priceImpactPct, contextSlot
+     (the Solana slot the quote was computed against), and routePlan.
+
+The rate-limit gate — three mechanisms stacked:
+
+  a) Serialization. A module-level promise chain (`requestQueue`) ensures only
+     one Jupiter request is ever in flight across the entire process. New calls
+     chain onto the tail of the previous one, and the chain is kept alive on
+     both fulfilment and rejection so one failed request can never deadlock the
+     queue.
+  b) Pacing. A module-level timestamp (`nextAllowedRequestAt`) enforces a
+     minimum 750 ms gap between consecutive requests. A request that arrives
+     early sleeps the difference first.
+  c) Cooldown on 429. If Jupiter replies 429 (Too Many Requests), the client
+     reads the Retry-After header (falling back to a 10-second default, and
+     never cooling down for less than that default), pushes the global
+     nextAllowedRequestAt forward by that cooldown so every other queued request
+     also waits, and retries at most once before throwing "Jupiter quote rate
+     limited after retry".
+
+Consequence worth understanding: because requests are serialized at 750 ms
+apiece, ~22 quote calls take roughly 17–20 seconds of wall clock. This was the
+single largest constraint in the system.
+
+AS OF 2026-10-16 THIS CLIENT IS NO LONGER ON THE HOT PATH. The bot prices every
+leg with its own on-chain math (section 14) and calls Jupiter exactly twice per
+cycle: once per scan for a single round-robin cross-check, and during startup
+pool-address discovery. The client itself is unchanged — what changed is how
+often it is called. Its 750 ms gate now paces a diagnostic rather than the
+scan loop.
+
+--------------------------------------------------------------------------------
+6. STEP FOUR — FINDING THE REAL POOLS (src/onchain/poolRegistry.ts)
+--------------------------------------------------------------------------------
+
+To independently verify a quote, the bot must read the exact on-chain account the
+trade would hit. There is no universal registry of "the SOL/USDC pool" on Solana,
+so address discovery is handled per DEX, resolved on first use and cached for one
+hour (a stale entry is simply re-resolved on the next request).
+
+  getPoolAddress(kind) -> Promise<PublicKey>, where kind is one of:
+  "raydium-v4" | "orca-v2" | "meteora-dlmm" | "whirlpool" | "raydium-clmm" |
+  "phoenix" | "openbook-v2"
+
+Discovery strategy per venue:
+
+  - raydium-v4, orca-v2: hardcoded, pre-verified mainnet addresses. These are
+    long-lived, well-known pools; a constant has one fewer failure mode than a
+    live discovery call.
+  - whirlpool, raydium-clmm, meteora-dlmm: resolved via `resolvePoolViaJupiterRoute`.
+    The trick: ask Jupiter for a 10 SOL -> USDC quote restricted to that single
+    DEX label, then read the real pool address (`ammKey`) straight out of the
+    returned route. 10 SOL is deliberately large — small amounts can get routed
+    through indirect multi-hop paths instead of engaging the pool directly.
+    Safety check: a one-DEX-filtered quote can still be multi-hop (e.g. SOL ->
+    USDT -> USDC), so the code scans routePlan for a hop whose input/output mints
+    are literally SOL and USDC and refuses anything else, rather than blindly
+    trusting routePlan[0].
+  - meteora-dlmm specifically: the SDK's deterministic PDA lookup does find *a*
+    pool for the pair, but in practice returned a stale pool priced ~20% away
+    from every other venue, and Meteora's REST API 404'd on every documented
+    path. The Jupiter-route approach finds the pool actually being traded, so
+    that is what is used.
+  - phoenix: downloads Phoenix's own published master_config.json from GitHub and
+    searches mainnet-beta.markets for the entry whose baseMint is SOL and
+    quoteMint is USDC.
+  - openbook-v2: hardcoded, pre-verified market address. Its SDK's
+    getProgramAccounts-based discovery is rejected outright by the public mainnet
+    RPC endpoint, and the SDK surfaces that rejection as an opaque internal error.
+
+--------------------------------------------------------------------------------
+7. STEP FIVE — READING REAL ON-CHAIN STATE (src/onchain/*)
+--------------------------------------------------------------------------------
+
+Four readers, one per market architecture. Each one's job is identical in spirit:
+turn a pool address into the raw numbers the swap formula needs. All of them read
+through the single shared mainnet Connection in connection.ts.
+
+7.1 constantProduct.ts — Raydium AMM v4 and Orca V2
+
+  - Decodes the pool account's raw bytes with hand-written @solana/buffer-layout
+    structs, using byte offsets confirmed against each program's source. Raydium
+    v4 pool accounts are 752 bytes with the vault pubkeys at offset 336; Orca V2
+    is a byte-identical fork of the legacy token-swap layout, 324 bytes.
+  - The vault pubkeys are read as plain 32-byte blobs and wrapped into PublicKey
+    after decode, sidestepping a module-resolution problem in
+    @solana/buffer-layout-utils under NodeNext.
+  - Fetches both vault token accounts in ONE batched getMultipleParsedAccounts
+    call (not two sequential ones), bringing the reader to a 2-RPC-call floor.
+  - Vault ordering is not guaranteed to be SOL-then-USDC, so it inspects each
+    parsed vault's mint to decide which reserve is which, and throws a clear
+    error if neither vault holds SOL or USDC.
+  - Returns reserveSOL, reserveUSDC and both vault addresses. Fee rate is a
+    typical default (0.25% Raydium, 0.30% Orca), not decoded per pool.
+
+7.2 clmm.ts — Orca Whirlpool and Raydium CLMM
+
+  - Concentrated liquidity means liquidity is not uniform; it is parked inside
+    tick ranges. So the reader needs both the pool account and the neighbouring
+    tick arrays.
+  - Decodes the pool account using each SDK's own Anchor decoder
+    (ParsableWhirlpool for Orca, PoolInfoLayout for Raydium) rather than
+    hand-rolled offsets, because these are packed/bytemuck layouts that are easy
+    to get subtly wrong.
+  - Derives up to four adjacent tick-array PDAs (offsets -1, 0, +1, +2 — matching
+    the maximum number Orca's own swap instruction will ever cross), fetches them
+    in one batched getMultipleAccountsInfo call, and flattens every initialized
+    tick's liquidityNet into a single Map<tickIndex, liquidityNet>. Uninitialized
+    arrays are skipped silently — they simply hold no liquidity events.
+  - The decimals subtlety that actually mattered: on-chain sqrtPrice and tick
+    indices express a RAW base-unit ratio and know nothing about token decimals.
+    Converting to a human "USDC per SOL" price requires multiplying by
+    sqrt(10^(9-6)). This decimalsAdjustment is both applied to sqrtPrice and
+    passed into the math class so its internal tick->price conversion stays on
+    the same scale. Omitting it produced nonsense the moment a trade crossed a
+    real tick boundary.
+  - Only the mint ordering where token A is SOL is supported; the reverse
+    ordering throws an explicit error rather than silently computing backwards.
+
+7.3 dlmm.ts — Meteora DLMM
+
+  - DLMM replaces a continuous curve with discrete price bins; each bin holds its
+    own X (SOL) and Y (USDC) reserves and trades at a fixed price, so slippage is
+    zero inside a bin and stepwise across bins.
+  - Decodes the lbPair account for activeId and binStep, validates the pair really
+    is SOL/USDC with SOL as token X, then derives three adjacent bin-array PDAs
+    (offsets -1, 0, +1 — 70 bins each) locally and fetches all three in ONE
+    batched RPC call.
+  - For each bin it records binId, human-adjusted price (via the SDK's own
+    getPriceOfBinByBinId, scaled by 10^(9-6)), and both reserves converted out of
+    base units.
+  - Fee rate uses a typical DLMM base fee (0.01%); the exact per-pool base/variable
+    fee split is not decoded.
+
+7.4 orderbook.ts — Phoenix and OpenBook V2
+
+  - Both venues are central limit order books, not AMMs, and both store their
+    books as intricate binary structures (a red-black tree for Phoenix, a slab
+    for OpenBook). Hand-parsing was deliberately not attempted.
+  - Phoenix: loads MarketState from the address through the official SDK and
+    reads a 10-level L2 ladder via getMarketUiLadder.
+  - OpenBook V2: constructs a read-only Anchor Provider with the throwaway
+    keypair, loads the Market, calls loadOrderBook(), and reads 10 L2 levels from
+    each side. Crucially, it resolves @coral-xyz/anchor through a `createRequire`
+    scoped to openbook-v2's own package path, so it gets the nested 0.29.0 copy
+    that SDK expects rather than whatever version the hoisted top-level
+    node_modules happens to contain (0.31.0/0.32.1 from the other SDKs).
+  - Both normalize to the same shape: askOrders ascending by price, bidOrders
+    descending, plus takerFeeRate (set to 0, since the ladder prices already
+    reflect the raw resting book and the fee is charged separately at settlement).
+
+7.5 stateStore.ts — the concurrent snapshot cache
+
+The four readers above answer "what is this one venue's state right now?".
+stateStore.ts answers "what is the WHOLE market's state right now?", and it is
+what made the system fast.
+
+  refreshAll() -> Promise<MarketSnapshot>
+
+  - Fires every venue's reader AND a getSlot() call simultaneously through
+    Promise.allSettled. The old pattern re-fetched a pool's accounts from
+    scratch on every individual price lookup, sequentially, behind Jupiter's
+    request gate.
+  - Returns a MarketSnapshot: the venues that succeeded, the ones that failed
+    with their reasons, the slot, and start/completion timestamps.
+  - Per-venue failure isolation is the entire point of allSettled. One dead
+    RPC read, one pool with a layout change, one illiquid market must never
+    blank the snapshot or throw into the scan loop — the same fail-soft
+    contract crossCheck.ts already guaranteed, now applied market-wide.
+  - warmUp() does one full refresh at startup so pool-address discovery (which
+    for three venues means a Jupiter route lookup) is paid before the first
+    real scan rather than inside it.
+
+Measured live: 343–519 ms for all seven venues, against ~20,000 ms for the
+sequential-quote approach it replaced.
+
+Because every venue in a snapshot is read at effectively the same instant, a
+cross-venue comparison built on one snapshot is a REAL simultaneous spread.
+That is a correctness property, not just a speed one.
+
+This module is also the designed seam for WebSocket account subscriptions.
+Consumers only ever ask for "current state of venue X", so replacing
+poll-refresh with push-updates underneath changes nothing above it.
+
+7.6 The recurring ESM workaround
+
+Three of these SDKs (@meteora-ag/dlmm, @orca-so/whirlpools-sdk,
+@openbook-dex/openbook-v2) ship broken ESM builds whose subpath imports fail
+strict Node ESM resolution. Every one of them is loaded through
+`createRequire(import.meta.url)` to force the working CJS build. This pattern is
+intentional and appears in clmm.ts, dlmm.ts, and orderbook.ts.
+
+--------------------------------------------------------------------------------
+8. STEP SIX — THE SWAP MATH (src/execution/swapMath.ts)
+--------------------------------------------------------------------------------
+
+This file is pure: it makes no network calls, holds no state beyond its
+constructor arguments, and is given numbers and returns numbers. Four classes,
+one per architecture, each implementing BOTH directions (swapUSDCForSOL and
+swapSOLForUSDC) because a round trip buys on one venue and sells on another.
+Each returns { amountOut, feePaid, executionPrice, newPoolPrice }.
+
+8.1 ConstantProductPool — Raydium v4, Orca V2
+
+  Invariant x·y = k. Take the fee off the input first, add the net input to that
+  side's reserve, solve the other reserve as k divided by the new reserve, and
+  the output is the difference. Execution price is net input over output;
+  newPoolPrice is the post-trade reserve ratio.
+
+8.2 CLMMPool — Whirlpool, Raydium CLMM
+
+  Within one tick range the virtual reserves satisfy x_v·y_v = L². The algorithm
+  walks ticks in the direction the trade pushes price (upward when buying SOL,
+  downward when selling), consuming liquidity range by range:
+    - compute the maximum input this range can absorb before price reaches the
+      next initialized tick,
+    - if the remaining input fits, finish inside the range,
+    - otherwise consume the whole range, cross the tick, apply that tick's
+      liquidityNet to the active liquidity, and continue,
+    - if liquidity ever goes non-positive, throw "Pool out of liquidity in range".
+  Where no further initialized tick exists, it synthesizes a boundary 100 tick
+  spacings away so the loop always terminates.
+
+  The numerical-stability point, which is a genuine correctness issue and not a
+  style preference: the textbook formula L·(1/a − 1/b) subtracts two nearly
+  identical large reciprocals whenever the trade is small relative to pool
+  liquidity — which is the normal case, since real L is on the order of 10^14 to
+  10^15. That is catastrophic floating-point cancellation and destroys almost all
+  precision. Every such expression was rewritten into an algebraically identical
+  but stable form — e.g. remainingIn/(currSqrtP·finalSqrtP) instead of
+  L·(1/currSqrtP − 1/finalSqrtP), and currSqrtP²·remainingIn/denom (with
+  denom = 1 + remainingIn·currSqrtP/L) on the sell side. The derivations are
+  written out in comments in the file, and any new math added here must follow
+  the same rule.
+
+8.3 DLMMPool — Meteora DLMM
+
+  Takes the fee off the input, then walks bins outward from the active bin in the
+  direction of the trade. Each bin has a fixed price, so filling within a bin is
+  linear (no slippage); crossing bins steps the price. A bin's capacity when
+  buying is reserveX·price in USDC; when selling it is reserveY/price in SOL. If
+  the input cannot be fully absorbed by the available bins, it throws
+  "Insufficient bin depth to complete trade".
+
+8.4 OrderBookDEX — Phoenix, OpenBook V2
+
+  Walks the real resting ladder level by level — asks when buying SOL, bids when
+  selling — filling each level completely until the remainder is smaller than the
+  level, then partially filling the last one. If the ladder runs out before the
+  input is exhausted it throws "Order book depth exhausted". The last filled
+  price is reported as the resulting market price.
+
+--------------------------------------------------------------------------------
+9. STEP SEVEN — THE GLUE LAYER (src/onchain/crossCheck.ts)
+--------------------------------------------------------------------------------
+
+One exported function is the bot's entire interface to the on-chain world:
+
+  computeOnChainSwap(dex, direction, amountHumanUnits) -> Promise<number | null>
+
+Internally:
+
+  1. buildPoolForDex(dex) is a switch over the DEX display name used in the bot's
+     DEXES list. Each case resolves the address from poolRegistry, calls the
+     matching reader, and constructs the matching swapMath class instance.
+  2. The resulting object is then asked for swapUSDCForSOL or swapSOLForUSDC
+     depending on direction, and its amountOut is returned.
+  3. "Quantum" has no case — it has no public SDK or IDL, so it falls through to
+     the default and returns null.
+
+The critical design rule: this function returns null, never throws. A missing
+reader, a dead RPC call, a layout change, a pool with no liquidity — all are
+caught, logged as a warning line, and reported as "no state available this
+scan". A failure here must never break the main scan loop.
+
+Two changes on 2026-10-16 opened this module up for reuse by the state store:
+
+  - buildPoolForDex() is now EXPORTED. stateStore.ts calls it directly to
+    construct every venue's pool object concurrently, rather than going through
+    computeOnChainSwap one swap at a time.
+  - The Swappable interface was widened from { amountOut } to the full
+    SwapResult, and exported. Local round-trip evaluation wants feePaid and
+    executionPrice too, and every swapMath class already returned exactly this
+    shape — so this made the typing accurate rather than merely permissive.
+
+computeOnChainSwap() itself remains as the single-swap entry point.
+
+--------------------------------------------------------------------------------
+10. STEP EIGHT — THE COST MODEL (src/execution/expenses.ts)
+--------------------------------------------------------------------------------
+
+This models exactly the costs that are NOT already baked into a quote — that is,
+everything that happens outside the swap instruction itself.
+
+  - Base fee: 5,000 lamports per required signature. Unchanged since genesis, so
+    treated as a constant rather than fetched.
+  - Priority fee: computeUnitLimit × computeUnitPriceMicroLamports ÷ 1,000,000,
+    with placeholder defaults of 400,000 CU and 50,000 micro-lamports/CU ≈ 20,000
+    lamports. These are explicitly rough; a live bot would pull real numbers from
+    getRecentPrioritizationFees and simulateTransaction.
+  - Jito tip: a SOL transfer to a tip account inside a bundle. Defaults to 0,
+    because it is only charged if the bundle actually lands.
+  - Rent: the rent-exempt minimum for a 165-byte SPL token account —
+    1,855,569 lamports, fetched live once and hardcoded since Solana's rent
+    schedule is effectively static. Charged only if the destination token account
+    does not already exist. The bot currently sets SELL_TOKEN_ACCOUNT_EXISTS =
+    false (confirmed via getTokenAccountsByOwner that no USDC account exists), so
+    every estimate includes this one-time ~0.00186 SOL charge — which is by far
+    the largest single cost item and routinely dwarfs the spread being chased.
+  - estimateRoundTripCost() rolls base fee + priority fee + tip + rent into one
+    object with both lamport and SOL totals.
+  - worstCaseOutputAfterSlippage() applies a 50 bps (0.5%) haircut to a quoted
+    output, for a pessimistic scenario.
+
+What this file deliberately EXCLUDES, and why: DEX swap fee, price impact, and
+slippage are not added on top of a quote, because the quote's outAmount already
+reflects them. Double-counting them would make every opportunity look falsely
+unprofitable. dexSwapFeeUnits() and priceImpactCost() exist only to surface how
+much of a quote's shortfall was fee versus impact — they are reporting helpers,
+not deductions.
+
+--------------------------------------------------------------------------------
+11. STEP NINE — THE ACTUAL BOT LOOP, STEP BY STEP (src/strategy/crossDex.ts)
+--------------------------------------------------------------------------------
+
+Configuration constants at the top of the file:
+
+  START_USDC                    = 10      pretend starting capital, per scan
+  SCAN_INTERVAL_MS              = 2,000   nominal gap between scans
+  MIN_PROFIT_PCT                = 0.10    minimum GROSS return, in percent
+  SAFETY_BUFFER_PCT             = 0.05    minimum NET return, in percent
+  MAX_SNAPSHOT_AGE_MS           = 3,000   a snapshot older than this is unusable
+  MAX_VENUE_ROUND_TRIP_LOSS_PCT = 2.0     venue self-spread sanity gate
+  MAX_PRICE_DEVIATION_PCT       = 5.0     cross-venue agreement sanity gate
+  SELL_TOKEN_ACCOUNT_EXISTS     = false   so rent is included in every estimate
+  LOG_FILE                      = ./logs/arbitrage-opportunities.jsonl
+
+The venue list lives in stateStore.ts as ONCHAIN_VENUES: Raydium, Orca V2,
+Meteora DLMM, Whirlpool, Raydium CLMM, Phoenix, OpenBook V2. "Quantum" is
+deliberately absent — it has no public SDK or IDL, so it cannot be priced
+locally and therefore cannot participate in the fast path at all.
+
+Startup (main):
+
+  1. Prints a banner stating "Mode: PAPER / QUOTE ONLY", "Execution: DISABLED",
+     and "Pricing: on-chain state (Jupiter demoted to off-path cross-check)".
+  2. Calls warmUp(), which resolves every venue's pool address up front. Three
+     venues discover theirs through a Jupiter route lookup, each serialized
+     behind the 750 ms request gate, so paying that here keeps it out of the
+     first real scan. Addresses are then cached for an hour.
+  3. Enters `while (true)`.
+
+Each iteration — scan() — in order:
+
+STEP 1. Take one concurrent snapshot of the whole market.
+  refreshAll() fires every venue's reader AND a getSlot() call simultaneously
+  through Promise.allSettled. Measured live at 343–519 ms for all seven venues.
+  Per-venue failure isolation is the whole point of allSettled: one dead RPC
+  read, one layout change, one illiquid market is recorded in `failures` and
+  simply absent from `venues` — it can never blank the snapshot or throw into
+  the loop.
+
+STEP 2. Print the snapshot header and any unavailable venues.
+  Venue count, slot, and how long the read took. Each failure prints its reason.
+
+STEP 3. Bail out early if the snapshot is unusable.
+  Fewer than two venues means there is no pair to compare. A snapshot already
+  older than MAX_SNAPSHOT_AGE_MS is skipped rather than used.
+
+STEP 4. Screen every venue through the sanity gates (assessVenues).
+  Because on-chain math is now the PRIMARY price source, a venue that decodes
+  to a nonsensical price drives decisions rather than merely adding noise. Two
+  guards, both pure local math, run before any pair is evaluated:
+
+    Guard 1 — self round trip. Buy 10 USDC worth of SOL on a venue and
+    immediately sell it back on that SAME venue. A healthy venue returns
+    roughly what went in, minus twice its fee. Losing more than
+    MAX_VENUE_ROUND_TRIP_LOSS_PCT (2%) means the book or curve is being read
+    wrong, or has no real liquidity.
+
+    Guard 2 — cross-venue agreement. Every venue surviving guard 1 should
+    agree on the price of SOL to within a fraction of a percent. One that is
+    more than MAX_PRICE_DEVIATION_PCT (5%) off the MEDIAN is assumed
+    misdecoded, not genuinely dislocated. Median rather than mean, so a single
+    wild outlier cannot drag the reference it is being judged against.
+
+  Each rejection prints its venue and reason. Both thresholds sit roughly 400x
+  above any real edge (cross-venue spreads on this pair measure ~0.005%), so
+  they can only ever catch garbage — they cannot suppress a real opportunity.
+
+  Verified live: Phoenix rejected at 30.98% self round-trip loss (implied
+  129.00 USDC/SOL), OpenBook V2 rejected at 100.00% (implied 2,425 USDC/SOL).
+
+STEP 5. Sweep every ordered pair of surviving venues.
+  Nested loop over usable x usable, skipping same-venue pairs. For each pair,
+  priceRoundTrip() computes both legs with nothing but local math:
+
+      buyResult  = buyVenue.pool.swapUSDCForSOL(10)
+      sellResult = sellVenue.pool.swapSOLForUSDC(buyResult.amountOut)
+
+  No network calls anywhere in this loop. Both legs come from the SAME
+  snapshot, so this measures a genuine simultaneous spread rather than two
+  market states observed seconds apart.
+
+  The swapMath classes throw when a venue cannot absorb the trade ("Order book
+  depth exhausted", "Pool out of liquidity in range", "Insufficient bin depth
+  to complete trade"). That is an ordinary outcome for a thin venue, not an
+  error — it is caught per pair, counted as `unfillable`, and never interrupts
+  the sweep.
+
+  With seven healthy venues this is 42 ordered pairs. The old
+  MAX_BUY_VENUES_TO_PROBE cap, which limited this to 14, existed purely to
+  bound Jupiter request volume; with local math there is nothing left to bound.
+
+STEP 6. printOpportunity — the profit math. (Detailed in section 12.)
+
+STEP 7. Print one summary line.
+  Pairs swept, venue count, any unfillable count, and the best buy leg this
+  snapshot — so the terminal still shows market movement even though only
+  CANDIDATEs print in full.
+
+STEP 8. Run ONE Jupiter cross-check, off the hot path.
+  runJupiterCrossCheck() picks one venue per scan, round-robin, and compares
+  the bot's own number against Jupiter's for the same trade. This happens
+  AFTER the sweep has already finished and logged, so a failure or a rate
+  limit costs nothing. One 750 ms request per scan, down from roughly 22
+  blocking ones.
+
+  Verified live: Raydium on-chain 0.095950583 SOL vs Jupiter 0.095950712 SOL
+  (-0.000%); Orca V2 +0.000%. This agreement is what justifies pricing on the
+  local path at all.
+
+STEP 9. Sleep and repeat.
+  main() measures how long the scan took and sleeps for
+  max(SCAN_INTERVAL_MS - elapsed, 250) ms.
+
+STEP 10. Never die.
+  scan() is wrapped in try/catch inside the loop. Any uncaught error prints
+  "Scan failed:" and the loop continues. The only way out is killing the
+  process, or a startup failure, which exits code 1.
+
+--------------------------------------------------------------------------------
+12. STEP TEN — THE PROFIT MATH, EXACTLY AS COMPUTED
+--------------------------------------------------------------------------------
+
+Inside printOpportunity, given startingUsdc (10) and the two legs computed from
+one snapshot:
+
+  solBought            = buy.outAmount  / 1e9
+  finalUsdc            = sell.outAmount / 1e6
+  grossProfitUsdc      = finalUsdc − startingUsdc
+  grossReturnPct       = (grossProfitUsdc / startingUsdc) × 100
+
+  usdcPerSol           = startingUsdc / solBought
+      ↑ the price implied by THIS buy leg specifically, used to convert the
+        lamport-denominated cost model into USDC without a separate price feed.
+
+  roundTripCost        = estimateRoundTripCost({ sellTokenAccountExists: false })
+  estimatedCostsUsdc   = roundTripCost.totalSol × usdcPerSol
+  estimatedNetProfitUsdc = grossProfitUsdc − estimatedCostsUsdc
+  estimatedNetReturnPct  = (estimatedNetProfitUsdc / startingUsdc) × 100
+
+  worstCaseFinalUsdc     = worstCaseOutputAfterSlippage(sell.outAmount) / 1e6
+      ↑ a 0.5% haircut on the sell leg only. The DEX swap fee and price impact
+        are already inside sell.outAmount, so this adds slippage risk alone.
+  worstCaseNetProfitUsdc = worstCaseFinalUsdc − startingUsdc − estimatedCostsUsdc
+
+  candidate = grossReturnPct      >= MIN_PROFIT_PCT   (0.10%)
+          AND estimatedNetReturnPct >= SAFETY_BUFFER_PCT (0.05%)
+
+Both thresholds must pass. The gross threshold filters out noise; the net
+threshold is the one that matters, because it has already paid for fees and
+rent. The small SAFETY_BUFFER_PCT margin above zero absorbs anything the cost
+model does not itemize.
+
+The formulas are unchanged from the Jupiter era — what changed is where
+buy.outAmount and sell.outAmount come from. They are now this bot's own
+on-chain computation against one coherent snapshot, rather than two aggregator
+quotes taken seconds apart.
+
+What "CANDIDATE" means and does not mean: it means "this line was interesting
+enough to be worth recording for later human review". It is explicitly not a
+trading signal, and nothing acts on it.
+
+A SOBERING NOTE ON THESE NUMBERS. Across 867 pre-rearchitecture records, this
+math produced ZERO candidates. Best gross return ever observed: 0.0048%. The
+cost hurdle on a $10 notional: 2.24%, almost all of it the one-time token
+account rent being amortized against a single hypothetical $10 trade. Even at
+zero cost, 0.0048% is still 20x below the 0.10% gross threshold. The thresholds
+are not the problem — the notional and the phantom rent charge are. See
+project-listing.txt entry [029].
+
+--------------------------------------------------------------------------------
+13. STEP ELEVEN — OUTPUT: WHAT YOU SEE AND WHAT GETS WRITTEN
+--------------------------------------------------------------------------------
+
+13.1 Terminal output
+
+A sweep is now 42 pairs every couple of seconds, so printing every pair would
+bury the one line that matters. Only CANDIDATEs print in full:
+
+  <buy venue> → <sell venue>
+  Start:          starting USDC
+  SOL bought:     SOL from the buy leg, 9 decimals
+  USDC back:      USDC from the sell leg, 6 decimals
+  Gross P&L:      USDC
+  Gross return:   percent
+  Est. costs:     USDC, with the full lamport breakdown inline
+  Est. net P&L:   USDC
+  Est. net return:percent
+  Worst case P&L: USDC at 0.5% slippage
+  Snapshot:       slot N, age Xms, read in Yms
+  STATUS:         CANDIDATE
+
+Every scan also prints, regardless of candidates:
+
+  [timestamp] snapshot: 6/7 venues @ slot 457712306 in 476ms
+    unavailable: Meteora DLMM (...)
+    rejected: Phoenix -- self round trip loses 30.98% (...)
+    rejected: OpenBook V2 -- self round trip loses 100.00% (...)
+    swept 12 pairs across 4 venues, best buy leg: Raydium CLMM 0.096245274 SOL
+    cross-check Raydium: on-chain 0.095950583 SOL vs Jupiter 0.095950712 SOL (-0.000%)
+
+The distinction between "unavailable" and "rejected" matters: unavailable means
+the venue could not be READ this snapshot (RPC failure, unsupported mint
+ordering); rejected means it was read fine but its decoded price failed a
+sanity gate.
+
+The single `Snapshot:` line replaces the old per-leg quote-age and
+context-slot lines. Those existed only because the two legs used to be quoted
+seconds apart; now one age and one slot describe the entire round trip.
+
+13.2 The log file — logs/arbitrage-opportunities.jsonl
+
+One JSON object per line, appended synchronously. EVERY evaluated pair is
+written, not just candidates — the NO_TRADE lines are the dataset showing how
+rarely a real edge exists. Each record contains:
+
+  timestamp (ISO 8601), buyDex, sellDex,
+  startingUsdc, solBought, finalUsdc,
+  grossProfitUsdc, grossReturnPct,
+  estimatedCostsUsdc,
+  costBreakdownLamports { baseFee, priorityFee, jitoTip, rent },
+  estimatedNetProfitUsdc, estimatedNetReturnPct,
+  worstCaseFinalUsdc, worstCaseNetProfitUsdc,
+  snapshotAgeMs, snapshotDurationMs, snapshotSlot,
+  priceSource: "onchain",
+  buyOnChainOutAmount, sellOnChainOutAmount   (BigInt, stringified),
+  status: CANDIDATE | NO_TRADE
+
+SCHEMA VERSIONING. The file contains records from two eras. Lines written
+before the 2026-10-16 rearchitecture have no `priceSource` field and carry the
+old per-leg fields instead (buyQuoteAgeMs, sellQuoteAgeMs, buyContextSlot,
+sellContextSlot). Lines written after carry `priceSource: "onchain"` and the
+three snapshot fields. Any consumer should treat every field as optional and
+branch on the presence of `priceSource`.
+
+--------------------------------------------------------------------------------
+14. THE TWO INDEPENDENT PRICE PATHS — AND WHICH ONE NOW LEADS
+--------------------------------------------------------------------------------
+
+The system derives prices through two paths that share no code:
+
+  Path A — this bot's own on-chain reader. Fetches the real pool accounts from
+  mainnet, decodes them, and runs the same math the DEX's own program runs.
+  Transparent, independently verifiable, and once the state is cached, costs
+  microseconds per evaluation.
+
+  Path B — Jupiter's quote API. Fast to call, handles routing, reflects what
+  you would actually get trading through the aggregator. But it is a black box,
+  and every call costs 750 ms behind a global serialization gate.
+
+THIS RELATIONSHIP WAS INVERTED ON 2026-10-16.
+
+Originally Path B priced everything and Path A was the cross-check. That made
+every scan cost ~22 serialized HTTP calls — roughly 20 seconds — which meant
+the buy and sell legs of a pair could be 10+ seconds apart. On a pair that
+reprices every 400 ms slot, that is not a spread; it is two different market
+states subtracted from each other.
+
+Now Path A prices every leg, and Path B verifies ONE venue per scan,
+round-robin, after the sweep has already finished and logged. The expensive,
+hard-won thing — four architectures of swap math and four on-chain readers —
+had already been built; it was simply being used as a footnote behind a slow
+HTTP call.
+
+WHY THIS WAS SAFE TO DO. The inversion was only defensible because the two
+paths had been running side by side long enough to show they agree. Measured
+live at the moment of the change: Raydium on-chain 0.095950583 SOL vs Jupiter
+0.095950712 SOL (-0.000%), Orca V2 +0.000%. Agreement to within rounding on
+the constant-product venues is what justified promoting the local path.
+
+WHAT THE INVERSION COST. A price that used to be a harmless diagnostic
+footnote now drives decisions. Two venues were immediately found producing
+implausible prices — Phoenix at a 31% self-spread, OpenBook V2 on a dead
+market — which under the old arrangement merely printed an odd percentage, but
+under the new one could fire a false CANDIDATE. That is the direct reason the
+sanity gates in section 11 step 4 exist. Jupiter remains in the loop precisely
+so this class of divergence keeps getting caught.
+
+--------------------------------------------------------------------------------
+15. HARD RULES THE PROJECT ENFORCES ON ITSELF
+--------------------------------------------------------------------------------
+
+  1. No real transaction signing or sending, ever. Paper-trading only.
+     STATUS: still in force, but this is the project's current STATE, not its
+     destination. The intent is to begin real execution once the pipeline is
+     wired. When that happens, CLAUDE.md must be updated in the same change
+     rather than silently violated.
+  2. DEX readers must fail soft. crossCheck.ts returns null on any failure, and
+     stateStore.ts isolates failures per venue, so a bad read can never take
+     down the scan loop.
+  3. swapMath.ts stays pure — no network calls — and numerically stable.
+     Formulas that subtract near-equal large quantities (the L·(1/a − 1/b)
+     family) are banned in favour of the rewritten stable forms already in the
+     file.
+  4. Broken ESM SDKs are worked around with createRequire(import.meta.url), not
+     "fixed" by switching to dynamic import.
+  5. src/strategy/collector.ts is out of scope and is not modified incidentally.
+  6. `npx tsc --noEmit` must pass before any change is considered done.
+  7. NEW (2026-10-16): any venue whose decoded price fails a sanity gate is
+     excluded from evaluation rather than traded against. Now that on-chain
+     math is the primary price source, a bad decode is a correctness hazard,
+     not a cosmetic one.
+
+--------------------------------------------------------------------------------
+16. KNOWN LIMITATIONS AND OPEN PROBLEMS
+--------------------------------------------------------------------------------
+
+Deliberate design limits:
+
+  - Quantum has no reader and therefore cannot be priced at all. It is a real,
+    live, Jupiter-routed program with no public SDK or documentation; a reader
+    would require reverse-engineering an unknown binary layout. It was dropped
+    from the venue list entirely when on-chain math became primary.
+  - Fee rates for constant-product, CLMM, and DLMM pools are typical defaults,
+    not decoded per pool. Good enough for comparison, not exact.
+  - Priority-fee constants are placeholders, not measured. A live bot would
+    query getRecentPrioritizationFees and simulate before sending.
+  - CLMM and DLMM readers only handle the mint ordering where SOL is token
+    A / X. The reverse throws a clear error rather than silently computing a
+    wrong price.
+
+Open problems, in priority order (see project-listing.txt for full detail):
+
+  1. THE RPC ENDPOINT IS NOW THE BOTTLENECK. SOLANA_MAINNET_RPC_URL is unset,
+     so all reads go to the public mainnet endpoint (~10 req/s). A refresh is
+     ~15 calls every 2 s. From the second scan onward this produces repeated
+     "429 Connection rate limits exceeded", degrading to 3/7 venues and a
+     9,284 ms snapshot. This is a CONFIG problem, not an architectural one —
+     a dedicated RPC is the single highest-value change available and
+     unblocks the full ~50x speedup the rearchitecture delivers.
+  2. The scan loop still POLLS. WebSocket accountSubscribe would make it
+     event-driven; stateStore.ts was built with that seam ready.
+  3. THE ECONOMICS DO NOT CLOSE AT $10 NOTIONAL. The one-time token-account
+     rent (1,855,569 lamports) is charged against every hypothetical $10
+     trade, creating a ~1.9% phantom hurdle against a measured edge of
+     ~0.005%. Fix: pre-create the ATAs so the line becomes a true zero, and
+     raise notional.
+  4. THE PHOENIX READER IS PROBABLY WRONG. It implies 129.00 USDC/SOL buying
+     and 89.04 selling — a 31% self-spread on a venue that is genuinely
+     liquid. Likely a units bug in the L2 ladder handling. Currently MASKED by
+     the sanity gate, not fixed.
+  5. MASKED IS NOT FIXED. The sanity gates exclude Phoenix and OpenBook V2
+     from evaluation. That makes the bot safe, not complete — two of seven
+     venues are silently out of the market until their readers are corrected.
+  6. METEORA POOL DISCOVERY IS NON-DETERMINISTIC. resolvePoolViaJupiterRoute
+     can return either mint ordering depending on which pool Jupiter routes
+     through at that moment, so Meteora intermittently drops out with "that
+     ordering isn't handled yet". An intermittent dropout is worse than a
+     constant failure because it is harder to notice.
+  7. THE STRATEGIC QUESTION IS STILL OPEN. The five healthy AMM venues agree
+     to within 0.5%, and best-buy vs best-sell is approximately zero. Faster
+     measurement makes an edge VISIBLE sooner; it does not CREATE one. If the
+     economics cannot close at size on SOL/USDC, that is an argument for a
+     different pair, not for more latency work.
+
+--------------------------------------------------------------------------------
+17. HOW TO RUN IT, FROM A CLEAN CHECKOUT
+--------------------------------------------------------------------------------
+
+  1. npm install
+  2. Create .env at the repo root:
+       JUPITER_API_KEY=<your Jupiter API key>
+       SOLANA_RPC_URL=<devnet or mainnet RPC, used by index.ts>
+       SOLANA_MAINNET_RPC_URL=<a dedicated mainnet RPC>
+
+     SOLANA_MAINNET_RPC_URL is technically optional — it falls back to the
+     public endpoint — but the bot is now RPC-bound rather than Jupiter-bound,
+     and the public endpoint rate-limits within two scans. Setting this is the
+     difference between 7/7 venues at ~400 ms and 3/7 venues at ~9,000 ms.
+  3. Place a Solana keypair JSON (64-byte array) at secrets/bot-keypair.json.
+     Only index.ts needs it; the bot itself does not.
+  4. Sanity check:          npx tsx src/index.ts
+     Prints wallet balance, slot, node version, and one live SOL→USDC quote.
+  5. Run the bot:           npx tsx src/strategy/crossDex.ts
+     Runs forever. Ctrl-C to stop. Watch logs/arbitrage-opportunities.jsonl.
+  6. Type check:            npx tsc --noEmit
+     Required before any change is considered complete.
+  7. Compile (optional):    npx tsc     → output in ./dist
+
+  Reading the output: each scan prints one snapshot line. "unavailable" means a
+  venue could not be read; "rejected" means it was read but failed a sanity
+  gate. Only CANDIDATEs print in full — every pair is still logged.
+
+--------------------------------------------------------------------------------
+18. THE LIFE OF A SINGLE NUMBER — END TO END IN ONE TRACE
+--------------------------------------------------------------------------------
+
+To make the whole pipeline concrete, here is one value's complete journey under
+the current architecture:
+
+   1. main() has already called warmUp(), so every venue's pool address is
+      resolved and cached. The loop calls scan().
+   2. scan() calls refreshAll(). Seven venue readers and a getSlot() call fire
+      CONCURRENTLY through Promise.allSettled.
+   3. The Raydium branch resolves its cached pool address, decodes the
+      752-byte pool account for its two vault pubkeys, and batch-fetches both
+      vaults' token balances in one getMultipleParsedAccounts call, matching
+      each to its mint.
+   4. Those reserves and a 0.25% fee construct a ConstantProductPool. The same
+      is happening for six other venues at the same instant.
+   5. ~476 ms later every reader has returned. The snapshot carries six healthy
+      venues, one failure (Meteora, unsupported mint ordering), and slot
+      457712306.
+   6. assessVenues() probes each venue: buy 10 USDC of SOL, sell it straight
+      back on the same venue. Raydium retains ~99.5% — healthy. Phoenix retains
+      69.02% and is rejected with its reason printed. OpenBook V2 retains 0%
+      and is rejected.
+   7. Four venues survive. The median implied price across them becomes the
+      reference; none deviates more than 5%, so all four pass guard 2.
+   8. The sweep runs 12 ordered pairs. For the Raydium → Orca V2 pair:
+      buyPool.swapUSDCForSOL(10) solves x·y=k locally and returns SOL;
+      sellPool.swapSOLForUSDC(thatSOL) walks Orca's curve and returns USDC.
+      Zero network calls. Microseconds. Both legs from the same snapshot.
+   9. printOpportunity computes gross P&L, derives usdcPerSol from this very
+      trade, prices the round-trip cost model in USDC through it, subtracts,
+      applies a 0.5% worst-case haircut, and tests both thresholds.
+  10. The verdict and every intermediate value are appended as one JSON line
+      to logs/arbitrage-opportunities.jsonl, stamped priceSource: "onchain"
+      and snapshotSlot: 457712306. It only prints to the terminal if it is a
+      CANDIDATE.
+  11. One summary line prints: pairs swept, venues used, best buy leg.
+  12. runJupiterCrossCheck() picks one venue round-robin and makes a SINGLE
+      Jupiter call to verify the bot's own number. Raydium: on-chain
+      0.095950583 SOL vs Jupiter 0.095950712 SOL, -0.000%. This is the line
+      that proves the local path can be trusted.
+  13. The loop sleeps for whatever remains of the 2,000 ms interval and does it
+      all again.
+
+And that is the whole system: one concurrent snapshot of every venue, four
+kinds of swap math run locally against it, two sanity gates protecting the
+decisions, an honest cost model, an independent aggregator check kept
+deliberately off the critical path, and an append-only record of every verdict
+— with no ability to spend a cent.
+
+================================================================================
+DOCUMENT HISTORY
+================================================================================
+
+  2026-10-14  Written against the Jupiter-primary architecture.
+  2026-10-16  Updated for the latency rearchitecture: on-chain math promoted to
+              the primary price path, concurrent state store added, full pair
+              matrix swept, venue sanity gates introduced, Jupiter demoted to
+              an off-hot-path cross-check. Sections 0, 1, 2, 5, 7, 9, 11, 12,
+              13, 14, 15, 16, 17 and 18 revised.
+
+  Change-by-change history lives in project-listing.txt.
+
+================================================================================

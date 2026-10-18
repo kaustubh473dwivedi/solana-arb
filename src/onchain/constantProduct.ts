@@ -76,13 +76,16 @@ export async function fetchConstantProductReserves(
 ): Promise<ConstantProductReserves> {
   const { vaultA, vaultB } = await getVaultAddresses(poolAddress, variant);
 
-  const [vaultAInfo, vaultBInfo] = await Promise.all([
-    mainnetConnection.getParsedAccountInfo(vaultA),
-    mainnetConnection.getParsedAccountInfo(vaultB),
+  // One batched RPC call for both vaults (getMultipleParsedAccounts), not two
+  // separate ones -- brings this function's total to the 2-call floor (pool
+  // account, then vaults), matching CLMM/DLMM's floor instead of sitting at 3.
+  const { value: vaultInfos } = await mainnetConnection.getMultipleParsedAccounts([
+    vaultA,
+    vaultB,
   ]);
 
-  const infoA = (vaultAInfo.value?.data as any)?.parsed?.info;
-  const infoB = (vaultBInfo.value?.data as any)?.parsed?.info;
+  const infoA = (vaultInfos[0]?.data as any)?.parsed?.info;
+  const infoB = (vaultInfos[1]?.data as any)?.parsed?.info;
 
   if (!infoA || !infoB) {
     throw new Error(

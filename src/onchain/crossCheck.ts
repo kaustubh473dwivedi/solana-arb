@@ -4,22 +4,31 @@ import { fetchConstantProductReserves, DEFAULT_FEE_RATE } from "./constantProduc
 import { fetchDlmmState } from "./dlmm.js";
 import { fetchCLMMState } from "./clmm.js";
 import { fetchPhoenixOrderBook, fetchOpenBookOrderBook } from "./orderbook.js";
-import { ConstantProductPool, CLMMPool, DLMMPool, OrderBookDEX } from "../execution/swapMath.js";
+import {
+  ConstantProductPool,
+  CLMMPool,
+  DLMMPool,
+  OrderBookDEX,
+  type SwapResult,
+} from "../execution/swapMath.js";
 
 const SOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
 const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 
 export type SwapDirection = "usdc-to-sol" | "sol-to-usdc";
 
-interface Swappable {
-  swapUSDCForSOL(amountInUSDC: number): { amountOut: number };
-  swapSOLForUSDC(amountInSOL: number): { amountOut: number };
+// Widened from `{ amountOut }` to the full SwapResult: now that the state
+// store evaluates round trips locally, callers want feePaid/executionPrice
+// too, and every swapMath class already returns exactly this shape.
+export interface Swappable {
+  swapUSDCForSOL(amountInUSDC: number): SwapResult;
+  swapSOLForUSDC(amountInSOL: number): SwapResult;
 }
 
 // Only DEXes actually present in crossDex.ts's DEXES array get a case here.
 // "Quantum" has no public SDK/IDL (see plan), so no cross-check is possible
 // for it -- falls through to the default null case.
-async function buildPoolForDex(dex: string): Promise<Swappable | null> {
+export async function buildPoolForDex(dex: string): Promise<Swappable | null> {
   switch (dex) {
     case "Raydium": {
       const address = await getPoolAddress("raydium-v4");

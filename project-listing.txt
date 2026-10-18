@@ -1,0 +1,652 @@
+================================================================================
+SOLANA-ARB — CHANGE LOG
+Every architectural, algorithmic, feature, performance, and fix-level change,
+logged one by one, oldest first.
+================================================================================
+
+Companion to project-description.txt. That file describes what the system IS
+today; this file records HOW it got there, and why each decision was made.
+
+Entry format:
+  [ID] Title
+       Type    — Architectural / Algorithmic / Feature / Performance / Fix /
+                 Workaround / Docs / Finding
+       When    — date or commit
+       Files   — what it touched
+       What    — what actually changed
+       Why     — the reason it was done
+       Impact  — what it bought, or what it cost
+
+Legend of eras:
+  ERA 1  2026-09-07  Initial build                       (commit 3cf8d28)
+  ERA 2  2026-09-08  Dependency cleanup                  (commit f26926b)
+  ERA 3  pre-session RPC batching                        (uncommitted)
+  ERA 4  2026-10-14  Documentation                       (uncommitted)
+  ERA 5  2026-10-16  Latency rearchitecture              (uncommitted)
+
+================================================================================
+ERA 1 — INITIAL BUILD (2026-09-07, commit 3cf8d28)
+"cross dex arbitrage over four exchanges on solana"
+19 files, 6,643 insertions.
+================================================================================
+
+[001] Jupiter quote client with global request serialization
+      Type    — Architectural
+      Files   — src/market/quotes.ts (new)
+      What    — Every price lookup in the project routed through one function,
+                getQuote(), wrapping Jupiter's /swap/v1/quote endpoint. A
+                module-level promise chain serializes all requests so only one
+                is ever in flight process-wide.
+      Why     — Jupiter rate-limits aggressively. Concurrent requests from a
+                scan loop would trip 429s immediately and unpredictably.
+      Impact  — Predictable, well-behaved API usage. Cost: all quote latency
+                became additive, which later turned into the project's single
+                largest bottleneck (see [033]).
+
+[002] Request pacing and 429 cooldown handling
+      Type    — Feature
+      Files   — src/market/quotes.ts
+      What    — Minimum 750 ms gap between consecutive requests, enforced by a
+                module-level nextAllowedRequestAt timestamp. On a 429, reads
+                the Retry-After header (floor of 10 s), pushes the global
+                window forward so every queued request also waits, and retries
+                at most once.
+      Why     — Back off cooperatively rather than hammering and getting
+                harder-rate-limited.
+      Impact  — The bot survives rate limiting instead of crashing. The 750 ms
+                figure became the de facto clock of the whole system.
+
+[003] Per-venue price discovery via the `dexes` filter
+      Type    — Algorithmic
+      Files   — src/market/quotes.ts, src/strategy/crossDex.ts
+      What    — Passing a single-element `dexes` array to Jupiter forces it to
+                quote using only that one venue.
+      Why     — Jupiter is a routing aggregator; by default it returns the best
+                blended route, which is useless for comparing venues against
+                each other.
+      Impact  — Turned an aggregator into a per-venue price oracle. This is the
+                trick that made cross-DEX comparison possible at all.
+
+[004] Off-chain cost model
+      Type    — Feature
+      Files   — src/execution/expenses.ts (new)
+      What    — Models base fee (5,000 lamports/signature), priority fee
+                (CU limit x CU price / 1e6), Jito tip (default 0), and token
+                account rent (1,855,569 lamports). Rolled up by
+                estimateRoundTripCost().
+      Why     — A gross spread is not a profit. Without costing, every tiny
+                price gap looks like an opportunity.
+      Impact  — P&L became honest. Later revealed the economics problem in
+                [031].
+
+[005] Deliberate exclusion of swap fee / price impact / slippage from the cost roll-up
+      Type    — Algorithmic
+      Files   — src/execution/expenses.ts
+      What    — estimateRoundTripCost() covers only costs charged win-or-lose.
+                DEX swap fee, price impact, and slippage are excluded because
+                they are already netted into any quote's outAmount.
+      Why     — Adding them on top would double-count and make every
+                opportunity look falsely unprofitable.
+      Impact  — Correct P&L. dexSwapFeeUnits() and priceImpactCost() were kept
+                as reporting helpers only, never as deductions.
+
+[006] Four-architecture swap math library
+      Type    — Architectural
+      Files   — src/execution/swapMath.ts (new, 402 lines)
+      What    — ConstantProductPool (x*y=k), CLMMPool (tick-based concentrated
+                liquidity), DLMMPool (discrete bins), OrderBookDEX (ladder
+                walking). Each implements both swap directions and returns
+                { amountOut, feePaid, executionPrice, newPoolPrice }.
+      Why     — To compute swap outputs independently of Jupiter, both to
+                verify it and to understand the mechanics.
+      Impact  — The single most valuable asset in the codebase. Became the
+                primary pricing engine two eras later in [033].
+
+[007] Purity constraint on swapMath.ts
+      Type    — Architectural
+      Files   — src/execution/swapMath.ts
+      What    — No network calls anywhere in the file. It is given numbers and
+                returns numbers; state fetching lives entirely in src/onchain/.
+      Why     — Testability and a clean seam between I/O and math.
+      Impact  — Made [033] possible without touching a line of the math.
+
+[008] CLMM decimalsAdjustment fix
+      Type    — Fix (algorithmic)
+      Files   — src/execution/swapMath.ts, src/onchain/clmm.ts
+      What    — Added a decimalsAdjustment constructor argument
+                (10^(decimalsSOL - decimalsUSDC) = 1000). A tick index always
+                maps to a RAW base-unit price ratio via 1.0001^tick, but
+                sqrtPrice and liquidity are supplied in human, decimals-adjusted
+                units.
+      Why     — Without it, tickToSqrtPrice() returned values on a completely
+                different scale than the current sqrt price.
+      Impact  — Fixed nonsensical output on any trade large enough to cross a
+                real initialized tick. Silent and severe before the fix.
+
+[009] Numerical stability rewrite — catastrophic cancellation
+      Type    — Fix (algorithmic)
+      Files   — src/execution/swapMath.ts
+      What    — Every instance of the textbook form L*(1/a - 1/b) was rewritten
+                into an algebraically identical but numerically stable form:
+                  buy side  -> remainingIn / (currSqrtP * finalSqrtP)
+                  sell side -> currSqrtP^2 * remainingIn / denom,
+                              where denom = 1 + remainingIn*currSqrtP/L
+      Why     — Real pool liquidity L is ~10^14-10^15, so any modest trade
+                barely moves sqrtPrice. Subtracting two nearly identical large
+                reciprocals destroys almost all floating-point precision.
+      Impact  — Correct output for normal trade sizes. Established a standing
+                rule for the file: never subtract near-equal large quantities.
+                Derivations are written out inline per call site.
+
+[010] Pool registry with per-DEX discovery strategies
+      Type    — Architectural
+      Files   — src/onchain/poolRegistry.ts (new)
+      What    — getPoolAddress(kind) resolves each DEX to its real on-chain
+                pool/market address, cached for 1 hour. Four different discovery
+                mechanisms depending on the venue.
+      Why     — There is no universal registry of "the SOL/USDC pool" on
+                Solana. Each program publishes (or fails to publish) its pools
+                differently.
+      Impact  — Address resolution moved off the hot path to a once-per-hour
+                cost.
+
+[011] Jupiter-route pool discovery trick
+      Type    — Algorithmic
+      Files   — src/onchain/poolRegistry.ts
+      What    — For Whirlpool, Raydium CLMM, and Meteora DLMM: ask Jupiter for
+                a 10 SOL -> USDC quote filtered to that one DEX label, then read
+                the real pool address (ammKey) out of the returned route.
+      Why     — Independently indexing every CLMM pool is a large project. The
+                router already knows which pool it would actually use.
+      Impact  — Reliable discovery of the *actively traded* pool, not just a
+                deterministically-derived one. 10 SOL was chosen deliberately —
+                small amounts get routed through indirect multi-hop paths.
+
+[012] Multi-hop guard on route-based discovery
+      Type    — Fix
+      Files   — src/onchain/poolRegistry.ts
+      What    — A one-DEX-filtered quote can still be multi-hop (e.g. SOL ->
+                USDT -> USDC). The code scans routePlan for a hop whose mints
+                are literally SOL and USDC, and throws otherwise, rather than
+                trusting routePlan[0].
+      Why     — Blindly taking the first hop would silently register the wrong
+                pool address.
+      Impact  — Prevented a class of silent wrong-pool bugs.
+
+[013] Meteora DLMM discovery — rejected the SDK's own PDA lookup
+      Type    — Finding / Architectural
+      Files   — src/onchain/poolRegistry.ts
+      What    — getCustomizablePermissionlessLbPairIfExists works, but was
+                verified live to return a stale pool priced ~20% off every
+                other venue. Meteora's REST API (dlmm-api.meteora.ag) 404'd on
+                every documented path. Routed through [011] instead.
+      Why     — A deterministic PDA finds *a* pool for the pair, not necessarily
+                a liquid one.
+      Impact  — Correct pricing for Meteora. Side effect discovered much later:
+                the route can return either mint ordering — see [043].
+
+[014] Constant-product reader with hand-rolled byte layouts
+      Type    — Feature
+      Files   — src/onchain/constantProduct.ts (new)
+      What    — Decodes Raydium AMM v4 (752-byte, vaults at offset 336) and
+                Orca V2 (324-byte, byte-identical fork of the legacy
+                token-swap layout) pool accounts with @solana/buffer-layout
+                structs, then reads both vault token accounts for real reserves.
+      Why     — These are simple, stable layouts; a full SDK dependency was
+                unnecessary.
+      Impact  — Two venues priced from raw on-chain bytes.
+
+[015] Vault-to-mint resolution rather than assumed ordering
+      Type    — Fix
+      Files   — src/onchain/constantProduct.ts
+      What    — Vault A/B ordering is not guaranteed to be SOL-then-USDC, so
+                each vault's parsed mint is inspected to decide which reserve is
+                which. Throws clearly if neither matches.
+      Why     — Assuming an order would silently invert the price.
+      Impact  — Removed a silent-wrong-answer failure mode.
+
+[016] Blob-decode workaround for @solana/buffer-layout-utils
+      Type    — Workaround
+      Files   — src/onchain/constantProduct.ts
+      What    — Vault pubkeys read as plain 32-byte blobs and wrapped into
+                PublicKey after decode, instead of using the library's publicKey
+                helper.
+      Why     — buffer-layout-utils uses a non-standard package.json "exports"
+                map that TypeScript's NodeNext moduleResolution cannot resolve.
+      Impact  — One fewer dependency problem; identical result.
+
+[017] CLMM reader using each SDK's own Anchor decoders
+      Type    — Feature
+      Files   — src/onchain/clmm.ts (new)
+      What    — ParsableWhirlpool / ParsableTickArray for Orca,
+                PoolInfoLayout / TickArrayLayout for Raydium. Fetches up to four
+                adjacent tick arrays (offsets -1, 0, +1, +2) and flattens every
+                initialized tick's liquidityNet into one Map.
+      Why     — These are packed/bytemuck layouts that are easy to get subtly
+                wrong by hand. The +2 ceiling matches the maximum Orca's own
+                swap instruction will ever cross.
+      Impact  — Two concentrated-liquidity venues priced correctly, including
+                tick crossing.
+
+[018] DLMM reader with bin-array traversal
+      Type    — Feature
+      Files   — src/onchain/dlmm.ts (new)
+      What    — Decodes the lbPair account for activeId/binStep, then reads
+                three adjacent bin arrays (70 bins each, offsets -1, 0, +1),
+                building a flat DLMMBin[] with decimals-adjusted prices via the
+                SDK's getPriceOfBinByBinId.
+      Why     — DLMM liquidity is discrete per bin; pricing needs the actual
+                bins, not a curve.
+      Impact  — Meteora priced from real bin reserves.
+
+[019] Order book readers via official SDKs
+      Type    — Feature
+      Files   — src/onchain/orderbook.ts (new)
+      What    — fetchPhoenixOrderBook() and fetchOpenBookOrderBook(), both
+                returning a normalized { askOrders, bidOrders, takerFeeRate }
+                shape with 10 L2 levels per side.
+      Why     — Both books are intricate binary structures (red-black tree for
+                Phoenix, slab for OpenBook). Hand-parsing was deliberately not
+                attempted.
+      Impact  — Two CLOB venues wired in. Note: the Phoenix reader was later
+                found to produce an implausible price — see [032].
+
+[020] createRequire workaround for broken ESM SDK builds
+      Type    — Workaround
+      Files   — src/onchain/clmm.ts, dlmm.ts, orderbook.ts, poolRegistry.ts
+      What    — @meteora-ag/dlmm, @orca-so/whirlpools-sdk, and
+                @openbook-dex/openbook-v2 are loaded via
+                createRequire(import.meta.url) to force their CJS builds.
+      Why     — Their compiled .mjs output contains subpath imports that fail
+                strict Node ESM resolution.
+      Impact  — Three otherwise-unusable SDKs made to work. Established as a
+                standing project pattern — explicitly NOT to be "fixed" by
+                switching to dynamic import.
+
+[021] Scoped Anchor resolution for OpenBook
+      Type    — Workaround
+      Files   — src/onchain/orderbook.ts
+      What    — @coral-xyz/anchor resolved through a createRequire scoped to
+                openbook-v2's own package path, so it gets the nested 0.29.0
+                copy rather than the hoisted 0.31.0/0.32.1 from other SDKs.
+      Why     — The three Solana SDKs each pin a genuinely different,
+                non-deduped Anchor version. There is no single correct
+                top-level version to declare.
+      Impact  — OpenBook loads against the IDL/API version it expects.
+
+[022] Read-only Anchor provider with a throwaway keypair
+      Type    — Workaround
+      Files   — src/onchain/orderbook.ts
+      What    — OpenBook's client requires a full Provider (connection +
+                wallet) even for pure reads, so a randomly generated,
+                never-funded, never-persisted Keypair satisfies the interface.
+      Why     — There was no read-only path through that SDK.
+      Impact  — Reads work with zero signing capability. Nothing is ever signed.
+
+[023] crossCheck glue layer with a null-on-failure contract
+      Type    — Architectural
+      Files   — src/onchain/crossCheck.ts (new)
+      What    — computeOnChainSwap(dex, direction, amount) as the single entry
+                point. buildPoolForDex() switches DEX name -> reader -> swapMath
+                class. Returns null — never throws — for a venue with no reader
+                or any live failure.
+      Why     — A cross-check is diagnostic, not load-bearing. A dead RPC call
+                or a layout change must never break the scan loop.
+      Impact  — Became a standing project rule. Directly enabled the per-venue
+                failure isolation in [027].
+
+[024] The scan loop, round-trip detection, and JSONL logging
+      Type    — Feature
+      Files   — src/strategy/crossDex.ts (new, 677 lines)
+      What    — Infinite loop calling scan() every ~5 s: collect a buy quote
+                from all 8 venues, print them, narrow to the best 2, test
+                selling on every other venue, compute P&L, print, and append one
+                JSON line per evaluated round trip to
+                logs/arbitrage-opportunities.jsonl.
+      Why     — The actual product.
+      Impact  — Working end-to-end paper scanner.
+
+[025] Quote freshness guard
+      Type    — Feature
+      Files   — src/strategy/crossDex.ts
+      What    — MAX_QUOTE_AGE_MS = 3,000. Any quote older than this is rejected
+                as STALE_QUOTE rather than used.
+      Why     — With serialized 750 ms requests, seconds elapse between the buy
+                and sell legs of the same pair.
+      Impact  — Prevented acting on stale prices. Also quietly revealed the
+                architecture's core problem: staying under 3 s was nearly
+                impossible. Superseded by [029].
+
+[026] MAX_BUY_VENUES_TO_PROBE cap
+      Type    — Performance (mitigation)
+      Files   — src/strategy/crossDex.ts
+      What    — Only the top 2 buy venues get probed against sell venues,
+                capping a scan at ~22 Jupiter requests instead of ~64.
+      Why     — Purely to bound Jupiter request volume.
+      Impact  — Kept scans finite. Cost: 14 of 56 possible pairs evaluated, so
+                most of the market went unexamined. Removed in [028].
+
+================================================================================
+ERA 2 — DEPENDENCY CLEANUP (2026-09-08, commit f26926b)
+================================================================================
+
+[027] Removed dead dependencies and documented the Anchor pinning decision
+      Type    — Fix / Docs
+      Files   — package.json, package-lock.json, src/onchain/orderbook.ts,
+                readme.md
+      What    — Dropped unused packages. Documented why @coral-xyz/anchor is
+                deliberately NOT a top-level dependency (see [021]). readme.md
+                filled in (+215 lines).
+      Why     — A declared top-level Anchor version would not be what the
+                scoped require in orderbook.ts actually resolves to, so
+                declaring one would be actively misleading.
+      Impact  — Smaller dependency surface; the non-obvious decision is now
+                recorded at the call site rather than living in someone's head.
+
+================================================================================
+ERA 3 — RPC CALL BATCHING (pre-session, uncommitted)
+================================================================================
+
+[028] Batched vault fetch in the constant-product reader
+      Type    — Performance
+      Files   — src/onchain/constantProduct.ts
+      What    — Replaced two parallel getParsedAccountInfo() calls with a single
+                getMultipleParsedAccounts([vaultA, vaultB]).
+      Why     — Two round trips where one would do.
+      Impact  — Reader dropped from 3 RPC calls to the 2-call floor (pool
+                account, then vaults), matching CLMM and DLMM.
+
+[029] Batched bin-array fetch in the DLMM reader
+      Type    — Performance
+      Files   — src/onchain/dlmm.ts
+      What    — PDA derivation is pure local computation, so all three bin-array
+                addresses are now computed first and fetched in ONE
+                getMultipleAccountsInfo() call instead of three sequential
+                getAccountInfo() calls inside a loop. Loop rewritten as a
+                forEach over the batched results.
+      Why     — The sequential loop was doing three round trips for data that
+                could be fetched together.
+      Impact  — Reader dropped from 4 RPC calls to the 2-call floor. Both
+                batching changes turned out to be load-bearing for [032] —
+                a concurrent snapshot is only fast if each venue is cheap.
+
+================================================================================
+ERA 4 — DOCUMENTATION (2026-10-14)
+================================================================================
+
+[030] project-description.txt authored
+      Type    — Docs
+      Files   — project-description.txt (new)
+      What    — Full end-to-end description of the system: credentials, entry
+                points, every layer, the scan loop step by step, the exact
+                profit formulas, output formats, limitations, and a
+                single-number end-to-end trace.
+      Why     — The architecture had grown past what SYSTEM.md covered, and the
+                non-obvious decisions were scattered across inline comments.
+      Impact  — One readable account of the whole system.
+
+================================================================================
+ERA 5 — LATENCY REARCHITECTURE (2026-10-16)
+Trigger: the project was measured as too slow to observe a real spread.
+================================================================================
+
+[031] FINDING — zero candidates in 867 scans is structural, not bad luck
+      Type    — Finding
+      Files   — logs/arbitrage-opportunities.jsonl (analysis only)
+      What    — 867 records, 0 CANDIDATE, 867 NO_TRADE. Best gross return ever
+                observed: 0.0048%. Cost hurdle on a $10 notional: 2.24%.
+      Why     — Three compounding causes:
+                  1. The cost floor is ~470x the measured edge. Almost all of it
+                     is TOKEN_ACCOUNT_RENT_LAMPORTS (1,855,569) — a ONE-TIME
+                     account creation cost being amortized against a single
+                     hypothetical $10 trade.
+                  2. A scan took ~20 s wall clock, so the buy and sell legs of a
+                     pair could be 10+ s apart. SOL/USDC reprices every slot
+                     (400 ms). That is two market states, not a spread.
+                  3. SOL/USDC is the most contested pair on Solana. A 0.005%
+                     spread is what a fully-arbitraged market looks like.
+      Impact  — Even at zero cost, 0.0048% is 20x below the 0.10% gross
+                threshold. Set the whole direction of Era 5.
+
+[032] Concurrent market-state store
+      Type    — Architectural
+      Files   — src/onchain/stateStore.ts (new)
+      What    — refreshAll() fetches every venue CONCURRENTLY via
+                Promise.allSettled into one slot-stamped MarketSnapshot.
+                Per-venue failure isolation: a failed venue is absent from
+                `venues` and recorded in `failures`, never blanking the
+                snapshot. warmUp() resolves all pool addresses at startup.
+      Why     — The old pattern re-fetched a pool's accounts from scratch on
+                every single price lookup, and queried venues sequentially
+                behind Jupiter's 750 ms gate.
+      Impact  — Full market snapshot: ~20,000 ms -> 343-519 ms measured live.
+                Also the designed seam for WebSocket subscriptions: consumers
+                only ask for "current state of venue X", so swapping
+                poll-refresh for push-updates changes nothing above it.
+
+[033] Hot-path inversion — on-chain math promoted to primary
+      Type    — Architectural
+      Files   — src/strategy/crossDex.ts, src/onchain/crossCheck.ts
+      What    — Reversed the relationship between the two price paths. Local
+                on-chain math now prices every leg; Jupiter verifies ONE venue
+                per scan, round-robin, AFTER the sweep has finished and logged.
+      Why     — Local math costs microseconds; a Jupiter call costs 750 ms. The
+                expensive thing was already built and was being used as a
+                footnote.
+      Impact  — Blocking Jupiter calls per scan: ~22 -> 1. VALIDATED LIVE: the
+                on-chain figure matched Jupiter to -0.000% on Raydium and
+                +0.000% on Orca V2, confirming the swapMath and reader stack is
+                correct and safe to trade against.
+
+[034] Full pair-matrix sweep
+      Type    — Algorithmic
+      Files   — src/strategy/crossDex.ts
+      What    — Removed MAX_BUY_VENUES_TO_PROBE ([026]). Every ordered pair of
+                distinct healthy venues is now evaluated.
+      Why     — The cap existed solely to bound Jupiter request volume. With
+                local math there is nothing left to bound.
+      Impact  — Pairs evaluated per scan: 14 -> 42 (full matrix of available
+                venues), at zero marginal network cost.
+
+[035] Snapshot-level freshness replaces per-leg quote age
+      Type    — Algorithmic / Fix
+      Files   — src/strategy/crossDex.ts
+      What    — MAX_QUOTE_AGE_MS (per-leg) replaced by MAX_SNAPSHOT_AGE_MS. The
+                record fields buyQuoteAgeMs / sellQuoteAgeMs / buyContextSlot /
+                sellContextSlot were replaced by a single snapshotAgeMs /
+                snapshotDurationMs / snapshotSlot.
+      Why     — Every venue in a snapshot is read concurrently, so one age and
+                one slot describe the whole round trip. The old per-leg fields
+                existed only because the legs used to be quoted seconds apart.
+      Impact  — This is a CORRECTNESS fix, not just bookkeeping. Both legs now
+                come from one coherent market state, so a measured spread is a
+                real simultaneous spread.
+
+[036] FINDING — Phoenix and OpenBook V2 produce implausible prices
+      Type    — Finding
+      Files   — (diagnosis; mitigated by [037])
+      What    — Measured from one live snapshot at slot 457710607:
+                  5 AMM venues agree within 0.5%  (103.83 - 104.46 USDC/SOL)
+                  Phoenix      buy 129.00 / sell  89.04  -> 31% self-spread
+                  OpenBook V2  buy 2425.00 / sell  0.00  -> dead market
+      Why     — OpenBook's SOL/USDC market is known to have almost no resting
+                liquidity. Phoenix is a real liquid venue, so its number points
+                to a probable units bug in the ladder reader ([019]).
+      Impact  — Became urgent BECAUSE of [033]: these prices were previously a
+                diagnostic footnote, but on the primary path they drive
+                decisions. Today they happen to produce losses, so nothing
+                false-fired — but a book skewed the other way would fire a fake
+                CANDIDATE, which on the path to real execution becomes a real
+                loss.
+
+[037] Venue sanity gates
+      Type    — Feature (safety)
+      Files   — src/strategy/crossDex.ts
+      What    — assessVenues() screens every venue before any pair is evaluated,
+                using two pure-local-math guards:
+                  Guard 1 — self round trip. Buy and immediately sell back on
+                    the SAME venue should retain ~1 - 2*fee. Losing more than
+                    MAX_VENUE_ROUND_TRIP_LOSS_PCT (2%) means the book or curve
+                    is being read wrong, or has no real liquidity.
+                  Guard 2 — cross-venue agreement. A surviving venue whose
+                    implied price is more than MAX_PRICE_DEVIATION_PCT (5%) off
+                    the MEDIAN across venues is assumed misdecoded, not
+                    dislocated. Median, not mean, so one wild outlier cannot
+                    drag the reference it is judged against.
+      Why     — Direct consequence of [036]. Promoting on-chain math to primary
+                made a bad decode dangerous rather than merely noisy.
+      Impact  — VERIFIED LIVE: Phoenix rejected at 30.98% self round-trip loss,
+                OpenBook V2 at 100%. Both thresholds sit ~400x above any real
+                edge (cross-venue spreads measure ~0.005%), so they can only
+                ever catch garbage — they cannot suppress a genuine opportunity.
+
+[038] Log schema v2 — priceSource discriminator
+      Type    — Feature
+      Files   — src/strategy/crossDex.ts, logs/arbitrage-opportunities.jsonl
+      What    — Records written by the on-chain path carry
+                "priceSource": "onchain". Pre-Era-5 lines have no such field.
+      Why     — The same file now contains records from two different pricing
+                regimes with different field sets.
+      Impact  — A consumer can tell the two eras apart. Reinforces that every
+                JSONL field should be treated as optional.
+
+[039] crossCheck exports widened for reuse
+      Type    — Fix (plumbing)
+      Files   — src/onchain/crossCheck.ts
+      What    — buildPoolForDex() exported; the Swappable interface widened from
+                { amountOut } to the full SwapResult and exported.
+      Why     — The state store needs to construct pools directly, and local
+                round-trip evaluation wants feePaid and executionPrice too.
+      Impact  — Accurate typing — every swapMath class already returned exactly
+                this shape.
+
+[040] Terminal output reduced to candidates only
+      Type    — Feature
+      Files   — src/strategy/crossDex.ts
+      What    — A sweep is now 42 pairs every ~2 s. Only CANDIDATEs print in
+                full; each scan emits one summary line plus a
+                bestBuyLegSummary(). Every pair is still written to the log.
+      Why     — Printing 42 blocks every 2 s buries the one line that matters.
+      Impact  — Readable terminal at the new scan rate; no loss of recorded data.
+
+[041] Scan interval retuned, adaptive floor added
+      Type    — Performance
+      Files   — src/strategy/crossDex.ts
+      What    — SCAN_INTERVAL_MS 5,000 -> 2,000; sleep floor 1,000 ms -> 250 ms.
+      Why     — The scan rate is no longer bounded by Jupiter's request gate,
+                only by RPC politeness. A full refresh is ~15 RPC calls.
+      Impact  — ~2.5x more scans per minute. Can drop to a few hundred ms on a
+                dedicated RPC, and stops being a poll interval entirely once
+                account subscriptions land.
+
+[042] FINDING — the bottleneck moved from architecture to RPC quota
+      Type    — Finding
+      Files   — (configuration, not code)
+      What    — SOLANA_MAINNET_RPC_URL is unset, so all on-chain reads go to the
+                public mainnet endpoint (~10 req/s). A refresh is ~15 calls at
+                2 s intervals. From the second scan onward: repeated
+                "429 Connection rate limits exceeded", degrading to 3/7 venues
+                and a 9,284 ms snapshot.
+      Why     — The public endpoint was adequate when the bot made a handful of
+                calls per 20 s scan. At the new rate it is not.
+      Impact  — The remaining bottleneck is now a CONFIG problem, not an
+                architectural one. Setting a dedicated RPC
+                (Helius / Triton / QuickNode, $0-50/mo) is the single
+                highest-value change available and unblocks the full 50x gain.
+
+[043] FINDING — Meteora pool discovery returns inconsistent mint ordering
+      Type    — Finding
+      Files   — src/onchain/poolRegistry.ts, src/onchain/dlmm.ts
+      What    — One run resolved 7/7 venues; the next resolved a Meteora pool
+                with USDC as tokenX, which the reader explicitly refuses
+                ("that ordering isn't handled yet").
+      Why     — resolvePoolViaJupiterRoute ([011]) can return either mint
+                ordering depending on which pool Jupiter routes through at that
+                moment.
+      Impact  — A documented limitation has become an INTERMITTENT venue
+                dropout on the primary path, which is worse than a constant
+                failure because it is harder to notice. Not yet fixed.
+
+================================================================================
+VERIFICATION RECORD FOR ERA 5
+================================================================================
+
+  npx tsc --noEmit                        exit 0
+  Live run, scan 1                        7/7 venues,  519 ms, 42 pairs swept
+  Live run, scan 2 (post sanity gates)    6/7 venues,  476 ms, 12 pairs, 4 venues
+  Live run, scan 3                        6/7 venues,  343 ms, 12 pairs, 4 venues
+  Cross-check Raydium                     on-chain vs Jupiter  -0.000%
+  Cross-check Orca V2                     on-chain vs Jupiter  +0.000%
+  Sanity gate, Phoenix                    rejected, 30.98% self round-trip loss
+  Sanity gate, OpenBook V2                rejected, 100.00% self round-trip loss
+  New-format records written              48, all carrying priceSource=onchain
+
+  Net effect of Era 5:
+    full market snapshot      ~20,000 ms  ->  343-519 ms      (~50x)
+    venue pairs per scan              14  ->  42              (full matrix)
+    blocking Jupiter calls/scan      ~22  ->  1               (off hot path)
+    legs priced from       states ~10s apart -> one snapshot  (correctness)
+
+================================================================================
+STANDING RULES ESTABLISHED ALONG THE WAY
+================================================================================
+
+  R1  No real transaction signing or sending. Paper-trading only.
+      Status: still in force. The user has stated the intent to go live once
+      the pipeline is wired; when that happens, CLAUDE.md must be updated in
+      the same change rather than silently violated.          (CLAUDE.md)
+
+  R2  DEX readers fail soft — return null, never throw. A cross-check failure
+      must never break the scan loop.                         ([023])
+
+  R3  swapMath.ts stays pure (no network calls) and numerically stable.
+      Formulas that subtract near-equal large quantities are banned.
+                                                              ([007], [009])
+
+  R4  Broken ESM SDKs are worked around with createRequire(import.meta.url),
+      not "fixed" by switching to dynamic import.             ([020])
+
+  R5  src/strategy/collector.ts is out of scope and is not modified
+      incidentally.                                           (CLAUDE.md)
+
+  R6  `npx tsc --noEmit` must pass before any change is considered done.
+                                                              (CLAUDE.md)
+
+================================================================================
+OPEN ITEMS, IN PRIORITY ORDER
+================================================================================
+
+  1.  Set SOLANA_MAINNET_RPC_URL to a dedicated endpoint.     ([042])
+      Config change, ~5 minutes, unblocks the full 50x speedup.
+
+  2.  WebSocket accountSubscribe to replace poll-refresh.     ([032])
+      The state store was built with this seam ready.
+
+  3.  Phase 2 economics:                                      ([031])
+        - pre-create the wSOL/USDC ATAs so the rent line becomes a true zero
+          instead of a phantom 1.9% hurdle on a $10 notional
+        - real priority fees from getRecentPrioritizationFees + simulate,
+          replacing the 400k x 50k placeholder
+        - sweep notional against real pool depth
+
+  4.  Diagnose the Phoenix ladder reader.                     ([036], [019])
+      Likely a units bug. Currently masked by the sanity gate, not fixed.
+
+  5.  Handle inverted mint ordering in the DLMM and CLMM readers.
+                                                              ([043], [013])
+
+  6.  Execution layer DESIGN (no signing code until R1 is lifted):
+        - both legs atomic in ONE versioned transaction with Address Lookup
+          Tables — separate transactions mean inventory risk, not arbitrage
+        - simulateTransaction gating every send
+        - slippage bounds encoded in the swap instruction itself
+        - Jito bundle and tip
+        - kill switch, position limits, max daily loss, DRY_RUN flag
+
+  7.  Open strategic question:                                ([031])
+      the five healthy AMMs agree to within 0.5% and best-buy vs best-sell is
+      ~zero. Faster measurement makes an edge VISIBLE sooner; it does not
+      CREATE one. If the economics cannot close at size on this pair, that is
+      an argument for a different pair, not for more latency work.
+
+================================================================================
